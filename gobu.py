@@ -3,6 +3,7 @@ import sys
 import re
 import subprocess
 import shutil
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -15,9 +16,6 @@ Uso:
 
 WORDLIST_DIRB = "/usr/share/wordlists/dirb/common.txt"
 WORDLIST_SECLISTS = "/usr/share/seclists/Discovery/Web-Content/common.txt"
-
-GOBUSTER_FILE = Path.cwd() / "gobuster.txt"
-CURL_FILE = Path.cwd() / "curl.txt"
 
 
 # ---------- utilidades ----------
@@ -44,10 +42,38 @@ def verificar_dependencias():
         sys.exit(1)
 
 
-def ejecutar_comando(comando):
-    """Corre un comando (lista de strings) y devuelve stdout+stderr combinados."""
-    proceso = subprocess.run(comando, capture_output=True, text=True)
-    return proceso.stdout + proceso.stderr
+def ejecutar_comando(comando, mostrar_en_vivo=True):
+    """
+    Corre un comando (lista de strings) y devuelve stdout+stderr combinados.
+    Si mostrar_en_vivo=True, va imprimiendo cada línea a medida que el
+    proceso la genera (en vez de quedarse "colgado" en silencio), y al
+    final muestra cuánto tardó.
+    """
+    if mostrar_en_vivo:
+        print(f"[*] Ejecutando: {' '.join(comando)}")
+
+    inicio = time.time()
+    proceso = subprocess.Popen(
+        comando,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    lineas = []
+    for linea in proceso.stdout:
+        lineas.append(linea)
+        if mostrar_en_vivo:
+            print(linea, end="", flush=True)
+
+    proceso.wait()
+    duracion = time.time() - inicio
+
+    if mostrar_en_vivo:
+        print(f"[+] Listo ({duracion:.1f}s)\n")
+
+    return "".join(lineas)
 
 
 def detectar_longitud_wildcard(salida):
@@ -127,9 +153,11 @@ def curl_titulo_pagina(objetivo):
     """Trae el html y busca el <title> para identificar rápido de qué se trata el sitio."""
     url = normalizar_url(objetivo)
     comando = ["curl", "-s", url]
-    salida = ejecutar_comando(comando)
+    # acá no mostramos en vivo: es todo el HTML crudo, no aporta nada verlo pasar
+    salida = ejecutar_comando(comando, mostrar_en_vivo=False)
     match = re.search(r"<title>(.*?)</title>", salida, re.IGNORECASE | re.DOTALL)
     titulo = match.group(1).strip() if match else "(no encontrado)"
+    print(f"[*] {' '.join(comando)}  |  <title> encontrado: {titulo}\n")
     return f"$ {' '.join(comando)}  |  <title> encontrado: {titulo}\n"
 
 
@@ -138,26 +166,79 @@ def curl_titulo_pagina(objetivo):
 def escanear_objetivo(objetivo):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     encabezado = f"===== Objetivo: {objetivo} — {ts} =====\n"
+    print(f"\n{encabezado}")
+
+    pasos_totales = 7
+    paso_actual = 0
+
+    def marcar_paso(titulo):
+        nonlocal paso_actual
+        paso_actual += 1
+        print(f"\n[{paso_actual}/{pasos_totales}] {titulo}")
 
     salida_gobuster = encabezado
+
+    marcar_paso("gobuster dir (wordlist dirb)")
     salida_gobuster += "\n--- gobuster dir (wordlist dirb) ---\n"
     salida_gobuster += gobuster_dir(objetivo, WORDLIST_DIRB)
+
+    marcar_paso("gobuster dir (wordlist seclists, 50 threads)")
     salida_gobuster += "\n--- gobuster dir (wordlist seclists, 50 threads) ---\n"
     salida_gobuster += gobuster_dir(objetivo, WORDLIST_SECLISTS, threads=50)
+
+    marcar_paso("gobuster vhost")
     salida_gobuster += "\n--- gobuster vhost ---\n"
     salida_gobuster += gobuster_vhost(objetivo)
 
     salida_curl = encabezado
+
+    marcar_paso("curl -I (headers)")
     salida_curl += "\n--- curl -I (headers) ---\n"
     salida_curl += curl_headers(objetivo)
+
+    marcar_paso("curl -I -L (siguiendo redirects)")
     salida_curl += "\n--- curl -I -L (siguiendo redirects) ---\n"
     salida_curl += curl_siguiendo_redirect(objetivo)
+
+    marcar_paso("curl robots.txt")
     salida_curl += "\n--- curl robots.txt ---\n"
     salida_curl += curl_robots(objetivo)
+
+    marcar_paso("curl titulo de la pagina")
     salida_curl += "\n--- curl titulo de la pagina ---\n"
     salida_curl += curl_titulo_pagina(objetivo)
 
     return salida_gobuster, salida_curl
+
+
+def determinar_archivos_salida(ip, domain):
+    """
+    Decide en qué archivos escribir los resultados de esta corrida.
+
+    Si ya existe una corrida previa con exactamente esta misma combinación
+    de ip/dominio (detectado por una marca interna guardada en el archivo),
+    no la pisa ni sigue amontonando ahí: busca el siguiente archivo libre
+    (gobuster2.txt/curl2.txt, gobuster3.txt/curl3.txt, ...).
+
+    Si es la primera vez que se corre esta combinación, usa/crea el
+    archivo base (gobuster.txt/curl.txt), acumulando como antes.
+    """
+    marcador = f"# RUN_KEY: ip={ip} dominio={domain}"
+    numero = 1
+
+    while True:
+        sufijo = "" if numero == 1 else str(numero)
+        ruta_gobuster = Path.cwd() / f"gobuster{sufijo}.txt"
+        ruta_curl = Path.cwd() / f"curl{sufijo}.txt"
+
+        if not ruta_gobuster.exists():
+            return ruta_gobuster, ruta_curl, marcador
+
+        contenido_previo = ruta_gobuster.read_text(encoding="utf-8", errors="ignore")
+        if marcador not in contenido_previo:
+            return ruta_gobuster, ruta_curl, marcador
+
+        numero += 1
 
 
 def scaning(ip=None, domain=None):
@@ -194,19 +275,26 @@ def main():
         else:
             domain = arg
 
-    resultado_gobuster, resultado_curl = scaning(ip=ip, domain=domain)
+    ruta_gobuster, ruta_curl, marcador = determinar_archivos_salida(ip, domain)
 
-    print(resultado_gobuster)
-    print(resultado_curl)
+    inicio_total = time.time()
+    resultado_gobuster, resultado_curl = scaning(ip=ip, domain=domain)
+    duracion_total = time.time() - inicio_total
+
+    # la marca va al principio del bloque para poder detectar reruns de este
+    # mismo objetivo la próxima vez que se corra gobu
+    resultado_gobuster = f"{marcador}\n" + resultado_gobuster
+    resultado_curl = f"{marcador}\n" + resultado_curl
 
     # "a" = append, para ir acumulando resultados de distintas corridas
-    with GOBUSTER_FILE.open("a", encoding="utf-8") as f:
+    with ruta_gobuster.open("a", encoding="utf-8") as f:
         f.write(resultado_gobuster)
 
-    with CURL_FILE.open("a", encoding="utf-8") as f:
+    with ruta_curl.open("a", encoding="utf-8") as f:
         f.write(resultado_curl)
 
-    print(f"\nResultados guardados en:\n  {GOBUSTER_FILE}\n  {CURL_FILE}")
+    print(f"\n[+] Escaneo completo en {duracion_total:.1f}s")
+    print(f"Resultados guardados en:\n  {ruta_gobuster}\n  {ruta_curl}")
 
 
 if __name__ == "__main__":
