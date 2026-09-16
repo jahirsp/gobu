@@ -76,12 +76,30 @@ def ejecutar_comando(comando, mostrar_en_vivo=True):
     return "".join(lineas)
 
 
+# Frases que gobuster usa para avisar que detectó una respuesta "wildcard"
+# (el server devuelve 200 para rutas que no existen, y eso ensucia los
+# resultados). El texto cambió entre versiones, así que revisamos varias:
+#   - versiones viejas: "Wildcard response found: ... => 200 (Length: 178)"
+#   - 3.8.x:            "the server returns a status code that matches the
+#                         provided options for non existing urls ... (Length:
+#                         8753). Please exclude the response length or the
+#                         status code..."
+FRASES_WILDCARD = (
+    "wildcard response found",
+    "please exclude the response length",
+    "exclude the status code or the length",
+)
+
+
+def hay_wildcard(salida):
+    salida_lower = salida.lower()
+    return any(frase in salida_lower for frase in FRASES_WILDCARD)
+
+
 def detectar_longitud_wildcard(salida):
     """
-    Gobuster, cuando detecta que el servidor responde 200 a rutas random
-    (falsos positivos), imprime algo como:
-    [!] Wildcard response found: http://target/asdasd => 200 (Length: 178)
-    Acá extraemos ese numero de longitud para poder excluirlo despues.
+    Busca el "(Length: 178)" que gobuster imprime junto con el aviso de
+    wildcard, para poder excluir esa longitud en el reintento.
     """
     match = re.search(r"Length:\s*(\d+)", salida)
     return match.group(1) if match else None
@@ -102,16 +120,25 @@ def gobuster_dir(objetivo, wordlist, threads=None):
     bloque = f"$ {' '.join(comando)}\n{salida}\n"
 
     # si hubo wildcard response, reintentamos excluyendo esa longitud
-    if "Wildcard response found" in salida:
+    if hay_wildcard(salida):
         longitud = detectar_longitud_wildcard(salida)
         if longitud:
             comando_filtrado = comando + ["--exclude-length", longitud]
+            print(
+                f"[!] Wildcard detectado (Length: {longitud}), "
+                f"reintentando con --exclude-length...\n"
+            )
             salida_filtrada = ejecutar_comando(comando_filtrado)
             bloque += (
                 f"\n[!] Wildcard detectado (Length: {longitud}), "
                 f"reintentando con --exclude-length\n"
             )
             bloque += f"$ {' '.join(comando_filtrado)}\n{salida_filtrada}\n"
+        else:
+            bloque += (
+                "\n[!] Se detectó una respuesta wildcard pero no pude "
+                "extraer la longitud a excluir; revisá la salida a mano.\n"
+            )
 
     return bloque
 
