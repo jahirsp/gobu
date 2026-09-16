@@ -1,0 +1,4 @@
+gobuster.txt
+curl.txt
+__pycache__/
+*.pyc
